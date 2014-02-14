@@ -1,4 +1,5 @@
 from collections import namedtuple
+from copy import copy
 from psycopg2.extensions import adapt, register_adapter, ISQLQuote
 
 from django.db import models, connections
@@ -36,31 +37,6 @@ class Vector(object):
         return field
 
 
-class VectorQuoter(ISQLQuote):
-    def prepare(self, conn):
-        qn = conn.ops.quote_name
-        self.table = qn(self._wrapped.model._meta.db_table)
-        self.column = qn(self._wrapped.field.column)
-
-    def getquoted(self):
-        return "setweight(to_tsvector('{config}', coalesce({table}.{column}, '')), '{weight}')".format(
-            config=self._wrapped.config,
-            table=self.table,
-            column=self.column,
-            weight=self._wrapped.weight,
-        )
-
-
-Vector = namedtuple('Vector', ['table', 'column', 'config', 'weight'])
-
-
-def adapt_vector(vector):
-    return VectorQuoter(vector)
-
-
-register_adapter(Vector, adapt_vector)
-
-
 class VQ(Q):
     """
     VQ('market__language') | VQ(product__name='A')
@@ -85,6 +61,52 @@ class VQ(Q):
             self.connector, ', '.join([str(c) for c in self.children]))
 
 
+class VectorQuoter(ISQLQuote):
+    def prepare(self, conn):
+        qn = conn.ops.quote_name
+        self.table = qn(self._wrapped.model._meta.db_table)
+        self.column = qn(self._wrapped.field.column)
+
+    def getquoted(self):
+        return "setweight(to_tsvector('{config}', coalesce({table}.{column}, '')), '{weight}')".format(
+            config=self._wrapped.config,
+            table=self.table,
+            column=self.column,
+            weight=self._wrapped.weight,
+        )
+
+
+class VQQuoter(ISQLQuote):
+    def __init__(self, vq):
+        self._vq = copy(vq)
+        self._conn = None
+
+    def prepare(self, conn):
+        self._conn = conn
+
+    def getquoted(self):
+        adapted_vectors = [adapt(v) for v in self._vq.children]
+        if self._conn is not None:
+            for obj in adapted_vectors:
+                if hasattr(obj, 'prepare'):
+                    obj.prepare(self._conn)
+        quoted_vectors = [o.getquoted() for o in adapted_vectors]
+        self._vq.children = quoted_vectors
+        return str(self._vq)
+
+
+def adapt_vector(vector):
+    return VectorQuoter(vector)
+
+
+def adapt_vq(vq):
+    return VQQuoter(vq)
+
+
+register_adapter(Vector, adapt_vector)
+register_adapter(VQ, adapt_vq)
+
+
 class VectorField(models.Field):
     """
     TODO:
@@ -97,13 +119,23 @@ class VectorField(models.Field):
         config=get_config
     )
     """
-    def __init__(self, *args, **kwargs):
+    def __init__(self, content, config='pg_catalog.english', *args, **kwargs):
         kwargs['null'] = True
         kwargs['default'] = ''
         kwargs['editable'] = False
         kwargs['serialize'] = False
         kwargs['db_index'] = True
+        self.content = content
+        self.config = config
         super(VectorField, self).__init__(*args, **kwargs)
+
+    def contribute_to_class(self, cls, name):
+        super(VectorField, self).contribute_to_class(cls, name)
+        # finish setting up VQ objects
+        for vq in self.content.children:
+            vq.model = self.model
+            if vq.config is None:
+                vq.config = self.config
 
     def db_type(self, *args, **kwargs):
         return 'tsvector'
@@ -123,6 +155,6 @@ class VectorField(models.Field):
 
 try:
     from south.modelsinspector import add_introspection_rules
-    add_introspection_rules(rules=[], patterns=['djorm_pgfulltext\.fields\.VectorField'])
+    add_introspection_rules(rules=[], patterns=['django-postgres-vectorfield\.fields\.VectorField'])
 except ImportError:
     pass
